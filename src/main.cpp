@@ -26,6 +26,8 @@ I2C_BM8563 rtc{I2C_BM8563_DEFAULT_ADDRESS, Wire};
 bool rtc_ok = false;
 void refresh_clock();
 ShakeDetector shake_detector;
+FaceOrient face_orient;
+bool imu_ok = false;
 ResponsePicker response_picker{kResponseCount};
 BallMachine ball;
 
@@ -43,7 +45,7 @@ lv_obj_t* pupil_l = nullptr;
 lv_obj_t* pupil_r = nullptr;
 lv_obj_t* mouth = nullptr;
 lv_obj_t* clock_label = nullptr;
-char clock_text[6] = "--:--";
+char clock_text[9] = "--:--:--";
 lv_obj_t* kind_label = nullptr;
 lv_obj_t* body_label = nullptr;
 
@@ -138,8 +140,94 @@ void tick_face(const std::uint32_t now_ms) {
     refresh_clock();
 }
 
+struct ClockStamp {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hours = 0;
+    int minutes = 0;
+    int seconds = 0;
+};
+
+int bcd_byte(const uint8_t value) {
+    return static_cast<int>((value >> 4) * 10 + (value & 0x0F));
+}
+
+bool build_stamp(ClockStamp& out) {
+    const char* date = __DATE__;
+    const char* months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    int month = 0;
+    for (int i = 0; i < 12; ++i) {
+        if (date[0] == months[i * 3] && date[1] == months[i * 3 + 1] && date[2] == months[i * 3 + 2]) {
+            month = i + 1;
+            break;
+        }
+    }
+    if (month == 0) {
+        return false;
+    }
+    out.month = month;
+    out.day = (date[4] == ' ' ? 0 : date[4] - '0') * 10 + (date[5] - '0');
+    out.year = (date[7] - '0') * 1000 + (date[8] - '0') * 100 + (date[9] - '0') * 10 + (date[10] - '0');
+    out.hours = (__TIME__[0] - '0') * 10 + (__TIME__[1] - '0');
+    out.minutes = (__TIME__[3] - '0') * 10 + (__TIME__[4] - '0');
+    out.seconds = (__TIME__[6] - '0') * 10 + (__TIME__[7] - '0');
+    return true;
+}
+
+bool stamp_sane(const ClockStamp& stamp) {
+    return stamp.year >= 2026 && stamp.year <= 2035 && stamp.month >= 1 && stamp.month <= 12
+        && stamp.day >= 1 && stamp.day <= 31 && stamp.hours <= 23 && stamp.minutes <= 59
+        && stamp.seconds <= 59;
+}
+
+bool stamp_before(const ClockStamp& rtc, const ClockStamp& built) {
+    if (rtc.year != built.year) {
+        return rtc.year < built.year;
+    }
+    if (rtc.month != built.month) {
+        return rtc.month < built.month;
+    }
+    if (rtc.day != built.day) {
+        return rtc.day < built.day;
+    }
+    if (rtc.hours != built.hours) {
+        return rtc.hours < built.hours;
+    }
+    if (rtc.minutes != built.minutes) {
+        return rtc.minutes < built.minutes;
+    }
+    return rtc.seconds < built.seconds;
+}
+
 // nRF TWIM repeated-start can wait forever. Use a full stop between write and read.
-bool read_clock(int& hours, int& minutes, bool* voltage_low) {
+bool read_stamp(ClockStamp& out, bool* voltage_low) {
+    Wire.beginTransmission(I2C_BM8563_DEFAULT_ADDRESS);
+    Wire.write(0x02);
+    if (Wire.endTransmission() != 0) {
+        return false;
+    }
+    if (Wire.requestFrom(static_cast<uint8_t>(I2C_BM8563_DEFAULT_ADDRESS), static_cast<uint8_t>(7)) != 7) {
+        return false;
+    }
+    uint8_t raw[7];
+    for (uint8_t& byte : raw) {
+        byte = static_cast<uint8_t>(Wire.read());
+    }
+    if (voltage_low != nullptr) {
+        *voltage_low = (raw[0] & 0x80) != 0;
+    }
+    out.seconds = bcd_byte(raw[0] & 0x7F);
+    out.minutes = bcd_byte(raw[1] & 0x7F);
+    out.hours = bcd_byte(raw[2] & 0x3F);
+    out.day = bcd_byte(raw[3] & 0x3F);
+    out.month = bcd_byte(raw[5] & 0x1F);
+    out.year = ((raw[5] & 0x80) != 0 ? 1900 : 2000) + bcd_byte(raw[6]);
+    return out.hours <= 23 && out.minutes <= 59;
+}
+
+// Three bytes only. A 7-byte read on this shared bus fails once touch polls, and the label stays put.
+bool read_clock(int& hours, int& minutes, int& seconds) {
     Wire.beginTransmission(I2C_BM8563_DEFAULT_ADDRESS);
     Wire.write(0x02);
     if (Wire.endTransmission() != 0) {
@@ -148,27 +236,42 @@ bool read_clock(int& hours, int& minutes, bool* voltage_low) {
     if (Wire.requestFrom(static_cast<uint8_t>(I2C_BM8563_DEFAULT_ADDRESS), static_cast<uint8_t>(3)) != 3) {
         return false;
     }
-    const uint8_t seconds_reg = Wire.read();
-    const uint8_t minutes_reg = Wire.read();
-    const uint8_t hours_reg = Wire.read();
-    auto bcd = [](uint8_t value) {
-        return static_cast<int>((value >> 4) * 10 + (value & 0x0F));
-    };
-    if (voltage_low != nullptr) {
-        *voltage_low = (seconds_reg & 0x80) != 0;
+    const int raw_seconds = bcd_byte(static_cast<uint8_t>(Wire.read()) & 0x7F);
+    const int raw_minutes = bcd_byte(static_cast<uint8_t>(Wire.read()) & 0x7F);
+    const int raw_hours = bcd_byte(static_cast<uint8_t>(Wire.read()) & 0x3F);
+    if (raw_hours > 23 || raw_minutes > 59 || raw_seconds > 59) {
+        return false;
     }
-    hours = bcd(hours_reg & 0x3F);
-    minutes = bcd(minutes_reg & 0x7F);
-    return hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59;
+    hours = raw_hours;
+    minutes = raw_minutes;
+    seconds = raw_seconds;
+    return true;
+}
+
+void apply_stamp(const ClockStamp& stamp) {
+    I2C_BM8563_DateTypeDef date{};
+    date.year = static_cast<int16_t>(stamp.year);
+    date.month = static_cast<int8_t>(stamp.month);
+    date.date = static_cast<int8_t>(stamp.day);
+    date.weekDay = 0;
+    I2C_BM8563_TimeTypeDef time{};
+    time.hours = static_cast<int8_t>(stamp.hours);
+    time.minutes = static_cast<int8_t>(stamp.minutes);
+    time.seconds = static_cast<int8_t>(stamp.seconds);
+    rtc.WriteReg(0x00, 0x20);  // STOP=1 while the registers are written
+    rtc.setDate(&date);
+    rtc.setTime(&time);
+    rtc.WriteReg(0x00, 0x00);  // STOP=0, oscillator runs
 }
 
 void refresh_clock() {
     int hours = 0;
     int minutes = 0;
-    if (!read_clock(hours, minutes, nullptr)) {
+    int seconds = 0;
+    if (!read_clock(hours, minutes, seconds)) {
         return;
     }
-    std::snprintf(clock_text, sizeof(clock_text), "%02d:%02d", hours, minutes);
+    std::snprintf(clock_text, sizeof(clock_text), "%02d:%02d:%02d", hours, minutes, seconds);
     if (clock_label != nullptr) {
         lv_label_set_text(clock_label, clock_text);
     }
@@ -366,13 +469,70 @@ void on_state_entered(const BallState state) {
     }
 }
 
+Acceleration read_imu() {
+    return {imu.readFloatAccelX(), imu.readFloatAccelY(), imu.readFloatAccelZ()};
+}
+
+void apply_screen_rotation(const std::uint8_t rot) {
+    if (rot == screen_rotation) {
+        return;
+    }
+    screen_rotation = rot;
+    tft.setRotation(rot);
+    if (scr != nullptr) {
+        lv_obj_invalidate(scr);
+        lv_refr_now(nullptr);
+    }
+    Serial.print("face rot=");
+    Serial.println(rot);
+}
+
+// Blocks until ~2s of quiet gravity, or 10s. Shakes are skipped. Fallback is rotation 0.
+std::uint8_t lock_screen_rotation() {
+    MountLock lock;
+    const MountLockConfig config;
+    const auto started = millis();
+    while (millis() - started < config.deadline_ms) {
+        if (lock.add(read_imu(), millis(), config)) {
+            break;
+        }
+        delay(20);
+    }
+    const auto rot = lock.rotation(config);
+    const float inv = lock.still_ms == 0 ? 0.0F : 1.0F / static_cast<float>(lock.still_ms);
+    Serial.print("mount still_ms=");
+    Serial.print(lock.still_ms);
+    Serial.print(" ax=");
+    Serial.print(lock.sum_x * inv, 2);
+    Serial.print(" ay=");
+    Serial.print(lock.sum_y * inv, 2);
+    Serial.print(" az=");
+    Serial.print(lock.sum_z * inv, 2);
+    Serial.print(" rot=");
+    Serial.println(rot);
+    return rot;
+}
+
 }  // namespace
 
 void setup() {
     Serial.begin(115200);
 
+    // screen_rotation is latched in lv_xiao_disp_init, so the IMU has to run first.
+    // Rail stays off and Wire1 waits forever if this pin is low.
+    pinMode(PIN_LSM6DS3TR_C_POWER, OUTPUT);
+    digitalWrite(PIN_LSM6DS3TR_C_POWER, HIGH);
+    delay(20);
+    imu_ok = imu.begin() == 0;
+    if (!imu_ok) {
+        Serial.println("IMU NOT FOUND");
+        screen_rotation = 0;
+    } else {
+        Serial.println("IMU ok");
+        screen_rotation = lock_screen_rotation();
+    }
+
     lv_init();
-    screen_rotation = 2;  // 180°, mounted upside down. Also rotates touch coords.
     lv_xiao_disp_init();
     lv_xiao_touch_init();
     build_ui();
@@ -382,29 +542,19 @@ void setup() {
         delay(10);
     }
 
-    // IMU rail is off until this pin is high. Leave it off and Wire1 waits forever.
-    pinMode(PIN_LSM6DS3TR_C_POWER, OUTPUT);
-    digitalWrite(PIN_LSM6DS3TR_C_POWER, HIGH);
-    delay(20);
-    if (imu.begin() != 0) {
-        Serial.println("IMU NOT FOUND");
-    } else {
-        Serial.println("IMU ok");
-    }
-
     // Touch and the BM8563 share Wire. IMU stays on Wire1.
-    int hours = 0;
-    int minutes = 0;
+    // ponytail: seed when VL is set, the date is garbage, or this firmware is newer
+    // than the RTC. A later reboot keeps coin-cell time. Ceiling: no clock newer than
+    // the build survives a dead cell; flash again to restamp.
+    ClockStamp running{};
+    ClockStamp built{};
     bool voltage_low = false;
-    rtc_ok = read_clock(hours, minutes, &voltage_low);
+    rtc_ok = read_stamp(running, &voltage_low);
     if (rtc_ok) {
         rtc.begin();
-        if (voltage_low) {
-            I2C_BM8563_TimeTypeDef seeded{};
-            seeded.hours = static_cast<int8_t>((__TIME__[0] - '0') * 10 + (__TIME__[1] - '0'));
-            seeded.minutes = static_cast<int8_t>((__TIME__[3] - '0') * 10 + (__TIME__[4] - '0'));
-            seeded.seconds = static_cast<int8_t>((__TIME__[6] - '0') * 10 + (__TIME__[7] - '0'));
-            rtc.setTime(&seeded);
+        if (build_stamp(built)
+            && (voltage_low || !stamp_sane(running) || stamp_before(running, built))) {
+            apply_stamp(built);
             Serial.println("RTC seeded from build time");
         }
         refresh_clock();
@@ -416,6 +566,10 @@ void setup() {
     const auto seed = static_cast<unsigned long>(
         micros() ^ static_cast<std::uint32_t>(std::fabs(imu.readFloatAccelX()) * 100000.0F));
     randomSeed(seed);
+
+    if (imu_ok) {
+        face_orient.arm(millis());
+    }
 
     Serial.println("pessimistic eight-ball ready");
 }
@@ -440,16 +594,30 @@ void loop() {
 
     if (ball.accepts_shake() && now_ms - last_imu_ms >= kImuIntervalMs) {
         last_imu_ms = now_ms;
-        const Acceleration sample{
-            imu.readFloatAccelX(),
-            imu.readFloatAccelY(),
-            imu.readFloatAccelZ(),
-        };
-        if (shake_detector.update(sample, now_ms)) {
+        if (shake_detector.update(read_imu(), now_ms)) {
             if (ball.request_trigger(now_ms)) {
                 begin_reveal();
                 advance_from_triggered(now_ms);
             }
+        }
+    }
+
+    if (imu_ok && face_orient.wants_sample(now_ms)) {
+        const Acceleration sample = read_imu();
+        std::uint8_t rot = screen_rotation;
+        const bool turn = face_orient.update(sample, now_ms, screen_rotation, rot);
+        Serial.print("grav ax=");
+        Serial.print(sample.x_g, 2);
+        Serial.print(" ay=");
+        Serial.print(sample.y_g, 2);
+        Serial.print(" az=");
+        Serial.print(sample.z_g, 2);
+        Serial.print(" up=");
+        Serial.print(screen_up_g(sample), 2);
+        Serial.print(" rot=");
+        Serial.println(turn ? rot : screen_rotation);
+        if (turn) {
+            apply_screen_rotation(rot);
         }
     }
 

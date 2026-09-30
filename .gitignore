@@ -7,4 +7,8 @@ compile_commands.json
 graphify-out/
 .DS_Store
 Thumbs.db
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
 

@@ -4,6 +4,9 @@ A sarcastic fortune teller for the Seeed Studio XIAO nRF52840 Sense and Round Di
 
 Shake it deliberately and the idle face gives way to a 900 ms mystic reveal. One of 48 yes, no, maybe, or ominous predictions remains visible for 15 seconds before the face returns.
 
+Parametric enclosure source, printable parts, test coupons, and assembly notes
+are in [cad/](cad/README.md).
+
 ## Hardware
 
 - Seeed Studio XIAO nRF52840 Sense

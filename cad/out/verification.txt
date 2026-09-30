@@ -1,0 +1,6 @@
+solids: valid closed solids
+shell: 3.00 mm nominal
+display: 43.5 mm aperture; 9.0 mm setback; 2.5 mm ledges
+bayonet: entry 0.000 mm3; detent 5.496 mm3; locked 0.000 mm3; stop 135.508 mm3
+battery: pack and clip swept envelope inside inner sphere
+usb: plug path clears bayonet collar; internal extension required

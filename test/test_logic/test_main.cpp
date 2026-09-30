@@ -122,6 +122,60 @@ void test_ball_machine_auto_timeout_and_input_lock() {
     TEST_ASSERT_TRUE(machine.request_trigger(250));
 }
 
+void test_mount_lock_picks_rotation_from_still_gravity() {
+    MountLock upright;
+    MountLock flipped;
+    MountLock flat;
+    const Acceleration up = kSeatedAccel;
+    const Acceleration down{0.04F, -0.67F, -0.70F};  // 180° in the glass plane
+    const Acceleration face_up{0.0F, 0.0F, -1.0F};
+
+    for (std::uint32_t t = 0; t <= 2000; t += 20) {
+        upright.add(up, t);
+        flipped.add(down, t);
+        flat.add(face_up, t);
+    }
+
+    TEST_ASSERT_EQUAL_UINT8(0, upright.rotation());
+    TEST_ASSERT_EQUAL_UINT8(2, flipped.rotation());
+    TEST_ASSERT_EQUAL_UINT8(0, flat.rotation());
+}
+
+void test_mount_lock_skips_shakes_and_short_stillness() {
+    MountLock lock;
+    const Acceleration upright = kSeatedAccel;
+    lock.add(upright, 0);
+    lock.add(upright, 20);
+    lock.add({3.0F, 0.0F, 0.0F}, 40);  // shake, dropped
+    TEST_ASSERT_FALSE(lock.still_ms >= 2000);
+    TEST_ASSERT_EQUAL_UINT8(0, lock.rotation());  // not enough quiet time
+
+    for (std::uint32_t t = 60; t <= 2060; t += 20) {
+        const Acceleration sample = (t == 500) ? Acceleration{2.5F, 0.0F, 0.0F} : upright;
+        lock.add(sample, t);
+    }
+    TEST_ASSERT_EQUAL_UINT8(0, lock.rotation());
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(2000, lock.still_ms);
+}
+
+void test_face_follows_a_slow_turn_each_second() {
+    const Acceleration upright = kSeatedAccel;
+    const Acceleration inverted{0.04F, -0.67F, -0.70F};
+    const Acceleration face_up{0.0F, 0.0F, -1.0F};
+    const Acceleration sideways{0.80F, 0.0F, -0.50F};
+
+    FaceOrient face;
+    std::uint8_t out = 9;
+    TEST_ASSERT_TRUE(face.update(inverted, 0, 0, out));
+    TEST_ASSERT_EQUAL_UINT8(2, out);
+    TEST_ASSERT_FALSE(face.update(upright, 500, 2, out));
+    TEST_ASSERT_TRUE(face.update(upright, 1000, 2, out));
+    TEST_ASSERT_EQUAL_UINT8(0, out);
+    TEST_ASSERT_FALSE(face.update({3.0F, 0.0F, 0.0F}, 2000, 0, out));
+    TEST_ASSERT_FALSE(face.update(face_up, 3000, 0, out));
+    TEST_ASSERT_FALSE(face.update(sideways, 4000, 0, out));
+}
+
 void run_all_tests() {
     RUN_TEST(test_stationary_and_tilt_do_not_trigger_shake);
     RUN_TEST(test_three_impacts_with_hysteresis_trigger_once);
@@ -130,6 +184,9 @@ void run_all_tests() {
     RUN_TEST(test_ball_machine_trigger_reveal_visible_reset);
     RUN_TEST(test_reroll_while_answer_is_visible);
     RUN_TEST(test_ball_machine_auto_timeout_and_input_lock);
+    RUN_TEST(test_mount_lock_picks_rotation_from_still_gravity);
+    RUN_TEST(test_mount_lock_skips_shakes_and_short_stillness);
+    RUN_TEST(test_face_follows_a_slow_turn_each_second);
 }
 
 #ifdef ARDUINO
